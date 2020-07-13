@@ -15,12 +15,23 @@ Usage:
     python3 blossom.py train --dataset=/path/to/blossom/dataset --weights=imagenet
 """
 
+# Set matplotlib backend
+# This has to be done before other importa that might
+# set it, but only if we're running in script mode
+# rather than being imported.
+if __name__ == '__main__':
+    import matplotlib
+    # Agg backend runs without a display
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
 import os
 import sys
 import json
 import datetime
 import numpy as np
 import skimage.draw
+import skimage.color, skimage.io, skimage.transform
 
 # Root directory of project
 ROOT_DIR = os.path.abspath("../../")
@@ -29,6 +40,7 @@ ROOT_DIR = os.path.abspath("../../")
 sys.path.append(ROOT_DIR)
 from mrcnn.config import Config
 from mrcnn import model as modellib, utils
+from mrcnn import visualize
 
 # Path to trained wights file
 COCO_WEIGHTS_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
@@ -37,6 +49,9 @@ COCO_WEIGHTS_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
 # through the command line argument --logs
 DEFAULT_LOGS_DIR = os.path.join(ROOT_DIR, "logs")
 
+
+# Results directory
+RESULTS_DIR = os.path.join(ROOT_DIR, "results/blossoms/")
 ############################################################
 #  Configurations
 ############################################################
@@ -61,7 +76,7 @@ class blossomConfig(Config):
     
     # Number of training steps per epoch
     # Default = 1000
-    STEPS_PER_EPOCH = 100
+    STEPS_PER_EPOCH = 1000
     
     # Minimum probability to be accepted as a detected object
     # Default = 0.7
@@ -72,6 +87,14 @@ class blossomConfig(Config):
     # Default = 50
     # VALIDATION_STEPS = 50
     
+    # Number of required detections per image
+    TRAIN_ROIS_PER_IMAGE = 20
+    
+    # Image Sizing
+    IMAGE_RESIZE_MODE = "square" # Pads width and height with zeros
+    IMAGE_MIN_DIM = 2048
+    IMAGE_MAX_DIM = 2624
+    
     
 ############################################################
 #  Dataset
@@ -79,13 +102,25 @@ class blossomConfig(Config):
 
 class blossomDataset(utils.Dataset):
     
+    def load_classes(self):
+        self.add_class("blossom", 1, "blossom")
+        
+    def prep(self, class_map=None):
+        def clean_name(name):
+            """Returns a shorter version of object names for cleaner display."""
+            return ",".join(name.split(",")[:1])
+        
+        self.num_classes = len(self.class_info)
+        self.class_ids = np.arange(self.num_classes)
+        self.class_names = [clean_name(c["name"]) for c in self.class_info]
+        
     def load_blossom(self, dataset_dir, subset):
         """Loads a subset of blossom dataset.
         dataset_dir: Root of dataset directory.
         subset: load either train or val subset
         """
-        # Add classes, this is simple since there is only one.
-        self.add_class("blossom", 1, "blossom")
+        # Add classes
+        self.load_classes()
         
         # Check if dataset is train or validation
         assert subset in ["train", "val"]
@@ -104,18 +139,18 @@ class blossomDataset(utils.Dataset):
             else:
                 polygons = [r['shape_attributes'] for r in a['regions']]
                 
-        # Load_mask() needs image size to convert polygons to masks.
-        # Do this by reading image, only possible with small dataset
-        image_path = os.path.join(dataset_dir, a['filename'])
-        image = skimage.io.imread(image_path)
-        height, width = image.shape[:2]
+            # Load_mask() needs image size to convert polygons to masks.
+            # Do this by reading image, only possible with small dataset
+            image_path = os.path.join(dataset_dir, a['filename'])
+            image = skimage.io.imread(image_path)
+            height, width = image.shape[:2]
         
-        self.add_image(
-            "blossom",
-            image_id = a['filename'],
-            path = image_path,
-            width = width, height = height,
-            polygons = polygons)
+            self.add_image(
+                "blossom",
+                image_id = a['filename'],
+                path = image_path,
+                width = width, height = height,
+                polygons = polygons)
         
     def load_mask(self, image_id):
         """Generates a mask for an image.
@@ -159,19 +194,19 @@ class blossomDataset(utils.Dataset):
 def train(model):
     """Train the model."""
     # Training dataset
-    dataset_train = BlossomDataset()
-    dataset_train.load_balloon(args.dataset, "train")
+    dataset_train = blossomDataset()
+    dataset_train.load_blossom(args.dataset, "train")
     dataset_train.prepare()
     
     # Validation dataset
-    dataset_val = BalloonDataset()
-    dataset_val.load_ballon(args.dataset, "val")
+    dataset_val = blossomDataset()
+    dataset_val.load_blossom(args.dataset, "val")
     dataset_val.prepare()
     
     print("Training network heads...")
     model.train(dataset_train, dataset_val,
                 learning_rate = config.LEARNING_RATE,
-                epochs = 30,
+                epochs = 1,
                 layers = 'heads')
 
 ############################################################
@@ -237,6 +272,17 @@ def mask_to_rle(image_id, mask, scores):
 #  Detection
 ############################################################
 
+def load_image(image_id):
+    # load image
+    image = skimage.io.imread(image_id)
+    # if grayscale. convert to RGB
+    if image.ndim != 3:
+        image = skimage.color.gray2rgb(image)
+    # if has an alpha channel, remove it for consistency
+    if image.shape[-1] == 4:
+        image = image[..., :3]
+    return image
+
 def detect(model, dataset_dir, subset):
     """Run detection on images in the given directory."""
     print("Running on {}".format(dataset_dir))
@@ -249,18 +295,27 @@ def detect(model, dataset_dir, subset):
     os.makedirs(submit_dir)
 
     # Read dataset
-    dataset = NucleusDataset()
-    dataset.load_nucleus(dataset_dir, subset)
+    dataset = blossomDataset()
+    dataset.load_classes()
+    #dataset.load_blossom(dataset_dir, subset)
     dataset.prepare()
+    sub_dir = os.path.join(dataset_dir, subset)
+    image_list = os.listdir(sub_dir)
     # Load over images
     submission = []
-    for image_id in dataset.image_ids:
+    print('Number of pics: ', len(image_list))
+    for image_id in image_list:
+        image_path = os.path.join(sub_dir, image_id)
         # Load image and run detection
-        image = dataset.load_image(image_id)
+        image = load_image(image_path)
         # Detect objects
-        r = model.detect([image], verbose=0)[0]
+        try:
+            r = model.detect([image], verbose=0)[0]
+        except:
+            print('Error occured')
+        numBlossoms = r['rois'].shape[0]
         # Encode image to RLE. Returns a string of multiple lines
-        source_id = dataset.image_info[image_id]["id"]
+        source_id = image_id
         rle = mask_to_rle(source_id, r["masks"], r["scores"])
         submission.append(rle)
         # Save image with masks
@@ -268,8 +323,8 @@ def detect(model, dataset_dir, subset):
             image, r['rois'], r['masks'], r['class_ids'],
             dataset.class_names, r['scores'],
             show_bbox=False, show_mask=False,
-            title="Predictions")
-        plt.savefig("{}/{}.png".format(submit_dir, dataset.image_info[image_id]["id"]))
+            title="Number of Blossoms: " + str(numBlossoms))
+        plt.savefig("{}/{}.png".format(submit_dir, image_id))
 
     # Save to csv file
     submission = "ImageId,EncodedPixels\n" + "\n".join(submission)
@@ -277,8 +332,45 @@ def detect(model, dataset_dir, subset):
     with open(file_path, "w") as f:
         f.write(submission)
     print("Saved to ", submit_dir)
-    
-    
+############################################################
+#  Counting
+############################################################    
+def countBlossoms(model, dataset_dir, subset):
+    """Run detection on images in the given directory."""
+    print("Running on {}".format(dataset_dir))
+
+    # Create directory
+    if not os.path.exists(RESULTS_DIR):
+        os.makedirs(RESULTS_DIR)
+    submit_dir = "submit_{:%Y%m%dT%H%M%S}".format(datetime.datetime.now())
+    submit_dir = os.path.join(RESULTS_DIR, submit_dir)
+    os.makedirs(submit_dir)
+
+    # Read dataset
+    dataset = blossomDataset()
+    print(dataset.image_ids[0])
+    dataset.load_blossom(dataset_dir, subset)
+    dataset.prep()
+    print('Number of pics: ', len(dataset.image_ids))
+    submission = []
+    print(dataset.image_ids[0])
+    raise stop
+    for image_id in dataset.image_ids:
+        print("Working on image: ", image_id)
+        # Load image and run detection
+        image = dataset.load_image(image_id)
+        # Detect objects
+        try:
+            r = model.detect([image], verbose=0)[0]
+        except:
+            print('Error occured')
+        numBlossoms = r['rois'].shape[0]
+        submission.append(str(numBlossoms))
+    submission = "Blossom Count\n" + "\n".join(submission)
+    file_path = os.path.join(submit_dir, "submit.csv")
+    with open(file_path, 'w') as f:
+        f.write(submission)
+    print("Saved to ", submit_dir)
 ############################################################
 #  Command Line
 ############################################################
@@ -292,7 +384,7 @@ if __name__=='__main__':
         description='Train Mask R-CNN to count blossoms.')
     parser.add_argument("command",
                         metavar="<command>",
-                        help="'train', 'eval', or 'count' (Count is currently unavailable)")
+                        help="'train', 'eval', or 'count'")
     parser.add_argument('--dataset', required=False,
                         metavar="/path/to/blossom/dataset/",
                         help='Directory of the Blossom dataset')
@@ -311,10 +403,10 @@ if __name__=='__main__':
     # Validate arguments
     if args.command == "train":
         assert args.dataset, "Argument --dataset is required for training"
-    elif args.command == "eval"
+    elif args.command == "eval":
         assert args.subset, "Provide --subset to run prediction on"
     elif args.command == "count":
-        assert False, "Count is not available yet."
+        assert args.subset, "Provide --subset to count on"
         
         
     print("Weights: ", args.weights)
@@ -324,10 +416,10 @@ if __name__=='__main__':
     print("Logs: ", args.logs)
     
     # Configurations
-    if args.command == "train:
-        config = BlossomConfig()
+    if args.command == "train":
+        config = blossomConfig()
     else:
-        class InferenceConfig(CocoConfig):
+        class InferenceConfig(blossomConfig):
             # Set batch size to 1 since we'll be running inference on
             # one image at a time. Batch size = GPU_COUNT * IMAGES_PER_GPU
             GPU_COUNT = 1
@@ -340,22 +432,20 @@ if __name__=='__main__':
     if args.command == "train":
         model = modellib.MaskRCNN(mode="training", config=config,
                                   model_dir=args.logs)
-    elif args.command == "eval":
+    else:
         model = modellib.MaskRCNN(mode="inference", config=config,
                                   model_dir=args.logs)
-    else:
-        raise Exception("Count is not available yet.")
         
     # Select weights file to load
     if args.weights.lower() == "coco":
         weights_path = COCO_WEIGHTS_PATH
         # Download weights file
         if not os.path.exists(weights_path):
-            utils.download_train_weights(weights_path)
-        elif args.weights.lower() == "last":
+            utils.download_trained_weights(weights_path)
+    elif args.weights.lower() == "last":
             # Get last trained weights
             weights_path = model.find_last()
-        else:
+    else:
             weights_path = args.weights
             
     # Load weights
@@ -372,9 +462,9 @@ if __name__=='__main__':
     if args.command == "train":
         train(model)
     elif args.command == "eval":
-        evaluate(model, args.dataset, args.subset)
+        detect(model, args.dataset, args.subset)
     elif args.command == "count":
-        raise Exception("Count is not available yet.")
+        countBlossoms(model, args.dataset, args.subset)
     else:
         print("'{}' is not recognized. "
               "Use 'train', 'eval', or 'count'".format(args.command))
