@@ -24,8 +24,8 @@ These instructions assume python has already been setup, for instruction on sett
 
 # Getting Started
 To begin download training, validation, and testing images and annotations into the dataset folder.
-    * Each set of images should be located in their own folder named 'train', 'test', and 'val'.
-    * The training and validation sets should contain image annotations in a .json file named 'via_region_data'.
+    * Each set of images should be located in their own folder named 'train', 'test', and 'val'
+    * The training and validation sets should contain image annotations in a .json file named 'via_region_data'
     * Image annotations can be completed using the [VGG Image annotator](https://www.robots.ox.ac.uk/~vgg/software/via/via_demo.html).
 Configurations can be found in the configuration class at line 59 in '/blossoms/blossom.py'.
 ## Training
